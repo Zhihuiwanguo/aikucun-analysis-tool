@@ -9,9 +9,9 @@ import streamlit as st
 st.set_page_config(page_title="爱库存经营自动分析工具 v1", layout="wide")
 
 
-# =========================
+# =====================================
 # 固定业务口径
-# =========================
+# =====================================
 BASE_COMMISSION_RATE = 0.18
 TECH_SERVICE_RATE = 0.12
 TRANSACTION_FEE_RATE = 0.006
@@ -26,9 +26,9 @@ GIFT_COST_MAP = {
 }
 
 
-# =========================
+# =====================================
 # 通用工具
-# =========================
+# =====================================
 def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
@@ -61,6 +61,13 @@ def safe_div(a: float, b: float) -> float:
     return a / b if b else 0.0
 
 
+def fmt_money(x: float) -> str:
+    return f"{x:,.2f}"
+
+
+# =====================================
+# 字段配置
+# =====================================
 @dataclass
 class ColumnConfig:
     platform: Optional[str]
@@ -70,6 +77,7 @@ class ColumnConfig:
     aftersale_type: Optional[str]
     pay_time: Optional[str]
     sku_code: Optional[str]
+    sales_spec_id: Optional[str]
     barcode: Optional[str]
     product_name: str
     spec_text: Optional[str]
@@ -79,9 +87,9 @@ class ColumnConfig:
     activity_name: Optional[str]
 
 
-# =========================
+# =====================================
 # 字段识别
-# =========================
+# =====================================
 def detect_order_columns(df: pd.DataFrame) -> ColumnConfig:
     return ColumnConfig(
         platform=pick_col(df, ["平台"], required=False),
@@ -91,6 +99,7 @@ def detect_order_columns(df: pd.DataFrame) -> ColumnConfig:
         aftersale_type=pick_col(df, ["售后类型"], required=False),
         pay_time=pick_col(df, ["支付时间", "付款时间", "支付成功时间"], required=False),
         sku_code=pick_col(df, ["货号"], required=False),
+        sales_spec_id=pick_col(df, ["销售规格ID"], required=False),
         barcode=pick_col(df, ["条形码"], required=False),
         product_name=pick_col(df, ["商品名称", "产品名称"]),
         spec_text=pick_col(df, ["规格"], required=False),
@@ -115,10 +124,10 @@ def validate_mapping_columns(link_df: pd.DataFrame, sales_df: pd.DataFrame, prod
             raise KeyError(f"标准产品主档表缺少字段：{col}")
 
 
-# =========================
-# 业务处理
-# =========================
-def mark_gift_name(name: str) -> Tuple[bool, Optional[str]]:
+# =====================================
+# 业务预处理
+# =====================================
+def mark_gift_name(name: str) -> Tuple[bool, str]:
     text = str(name).strip()
     if "维C赠品" in text:
         return True, "维C赠品"
@@ -126,36 +135,39 @@ def mark_gift_name(name: str) -> Tuple[bool, Optional[str]]:
         return True, "运动水杯"
     if "行李箱" in text:
         return True, "小熊行李箱"
-    return False, None
+    return False, ""
 
 
 def preprocess_orders(df: pd.DataFrame) -> Tuple[pd.DataFrame, ColumnConfig]:
     cfg = detect_order_columns(df)
     work = df.copy()
 
-    # 标准化字段
-    for col in [
-        cfg.store_name,
-        cfg.ad_no,
-        cfg.order_status,
-        cfg.product_name,
-    ]:
-        work[col] = as_str(work[col])
-
-    if cfg.aftersale_type:
-        work[cfg.aftersale_type] = as_str(work[cfg.aftersale_type])
-
+    # 平台
     if cfg.platform:
         work[cfg.platform] = as_str(work[cfg.platform])
     else:
         work["平台"] = "爱库存"
         cfg.platform = "平台"
 
+    # 基础文本列
+    for col in [cfg.store_name, cfg.ad_no, cfg.order_status, cfg.product_name]:
+        work[col] = as_str(work[col])
+
+    # 可选文本列
+    if cfg.aftersale_type:
+        work[cfg.aftersale_type] = as_str(work[cfg.aftersale_type])
+
     if cfg.sku_code:
         work[cfg.sku_code] = as_str(work[cfg.sku_code])
     else:
         work["货号"] = ""
         cfg.sku_code = "货号"
+
+    if cfg.sales_spec_id:
+        work[cfg.sales_spec_id] = as_str(work[cfg.sales_spec_id])
+    else:
+        work["销售规格ID"] = ""
+        cfg.sales_spec_id = "销售规格ID"
 
     if cfg.barcode:
         work[cfg.barcode] = as_str(work[cfg.barcode])
@@ -175,22 +187,30 @@ def preprocess_orders(df: pd.DataFrame) -> Tuple[pd.DataFrame, ColumnConfig]:
         work["活动名称"] = "未标注活动"
         cfg.activity_name = "活动名称"
 
+    # 数值列
     work[cfg.qty] = as_num(work[cfg.qty])
     work[cfg.paid_amount] = as_num(work[cfg.paid_amount])
     work[cfg.marketing_return] = as_num(work[cfg.marketing_return])
 
     # 赠品识别
     gift_flags = work[cfg.product_name].apply(mark_gift_name)
-    work["是否赠品"] = gift_flags.apply(lambda x: x[0]) | (as_str(work[cfg.sku_code]) == "")
-    work["赠品名称"] = gift_flags.apply(lambda x: x[1] if x[1] else "")
+    work["赠品名称"] = gift_flags.apply(lambda x: x[1])
+    work["是否赠品"] = gift_flags.apply(lambda x: x[0]) | as_str(work[cfg.sku_code]).eq("")
 
-    # 空货号赠品：货号自动匹配为条形码
+    # 空货号赠品：货号修正为条形码
     work["货号修正"] = as_str(work[cfg.sku_code])
     empty_sku_mask = work["货号修正"].eq("") & work["是否赠品"]
     work.loc[empty_sku_mask, "货号修正"] = as_str(work.loc[empty_sku_mask, cfg.barcode])
 
+    # 订单表内销售规格ID
+    work["订单销售规格ID"] = as_str(work[cfg.sales_spec_id])
+
     # 有效订单
-    aftersale_series = as_str(work[cfg.aftersale_type]) if cfg.aftersale_type else pd.Series("", index=work.index)
+    if cfg.aftersale_type:
+        aftersale_series = as_str(work[cfg.aftersale_type])
+    else:
+        aftersale_series = pd.Series("", index=work.index)
+
     work["是否无效订单"] = (
         as_str(work[cfg.order_status]).eq("订单取消")
         | aftersale_series.eq("退货退款")
@@ -203,17 +223,31 @@ def preprocess_orders(df: pd.DataFrame) -> Tuple[pd.DataFrame, ColumnConfig]:
     return work, cfg
 
 
-def build_cost_mapping(
-    link_df: pd.DataFrame, sales_df: pd.DataFrame, product_df: pd.DataFrame
-) -> pd.DataFrame:
-    validate_mapping_columns(link_df, sales_df, product_df)
-
+# =====================================
+# 映射构建
+# =====================================
+def build_link_map(link_df: pd.DataFrame) -> pd.DataFrame:
     link = link_df.copy()
-    sales = sales_df.copy()
-    product = product_df.copy()
+    link = clean_columns(link)
 
     for col in ["平台", "店铺名称", "货号", "销售规格ID"]:
         link[col] = as_str(link[col])
+
+    keep_cols = ["平台", "店铺名称", "货号", "销售规格ID"]
+    for optional_col in ["条形码", "规格", "销售规格名称", "是否主成交规格"]:
+        if optional_col in link.columns:
+            keep_cols.append(optional_col)
+
+    link = link[keep_cols].drop_duplicates()
+    return link
+
+
+def build_sales_cost_map(sales_df: pd.DataFrame, product_df: pd.DataFrame) -> pd.DataFrame:
+    sales = sales_df.copy()
+    product = product_df.copy()
+
+    sales = clean_columns(sales)
+    product = clean_columns(product)
 
     for col in ["销售规格ID", "标准产品ID"]:
         sales[col] = as_str(sales[col])
@@ -221,19 +255,17 @@ def build_cost_mapping(
     for col in ["标准产品ID", "标准产品名称"]:
         product[col] = as_str(product[col])
 
-    if "产品总成本" in sales.columns:
-        sales["产品总成本"] = as_num(sales["产品总成本"])
+    sales["产品总成本"] = as_num(sales["产品总成本"])
 
-    merged = link.merge(
-        sales[["销售规格ID", "标准产品ID", "产品总成本"]],
-        on="销售规格ID",
-        how="left",
-    ).merge(
-        product[["标准产品ID", "标准产品名称"]],
-        on="标准产品ID",
-        how="left",
-    )
+    sales_keep = ["销售规格ID", "标准产品ID", "产品总成本"]
+    for optional_col in ["销售规格名称", "销售数量"]:
+        if optional_col in sales.columns:
+            sales_keep.append(optional_col)
 
+    sales = sales[sales_keep].drop_duplicates()
+    product = product[["标准产品ID", "标准产品名称"]].drop_duplicates()
+
+    merged = sales.merge(product, on="标准产品ID", how="left")
     merged = merged.rename(columns={"产品总成本": "映射产品总成本"})
     return merged
 
@@ -241,56 +273,72 @@ def build_cost_mapping(
 def attach_costs(
     orders: pd.DataFrame,
     cfg: ColumnConfig,
-    cost_map: pd.DataFrame,
+    link_map: pd.DataFrame,
+    sales_cost_map: pd.DataFrame,
 ) -> pd.DataFrame:
     work = orders.copy()
 
-    join_cols = [
-        (cfg.platform, "平台"),
-        (cfg.store_name, "店铺名称"),
-        ("货号修正", "货号"),
-    ]
-
-    left_on = [x[0] for x in join_cols]
-    right_on = [x[1] for x in join_cols]
-
+    # 1. 先用 平台+店铺名称+货号 从链接表补销售规格ID
     work = work.merge(
-        cost_map[["平台", "店铺名称", "货号", "销售规格ID", "标准产品ID", "标准产品名称", "映射产品总成本"]],
-        left_on=left_on,
-        right_on=right_on,
+        link_map[["平台", "店铺名称", "货号", "销售规格ID"]],
+        left_on=[cfg.platform, cfg.store_name, "货号修正"],
+        right_on=["平台", "店铺名称", "货号"],
         how="left",
+        suffixes=("", "_link"),
     )
 
-    work["产品总成本"] = work["映射产品总成本"].fillna(0.0)
+    # 2. 最终销售规格ID：订单表优先，链接表兜底
+    work["最终销售规格ID"] = as_str(work["订单销售规格ID"])
+    need_fill_spec = work["最终销售规格ID"].eq("")
+    work.loc[need_fill_spec, "最终销售规格ID"] = as_str(work.loc[need_fill_spec, "销售规格ID"])
+
+    # 3. 按最终销售规格ID去销售规格映射表带成本
+    work = work.merge(
+        sales_cost_map,
+        left_on="最终销售规格ID",
+        right_on="销售规格ID",
+        how="left",
+        suffixes=("", "_cost"),
+    )
+
+    # 4. 统一关键列
+    work["销售规格ID"] = as_str(work["最终销售规格ID"])
+    work["产品总成本"] = as_num(work["映射产品总成本"])
     work["运费"] = 0.0
 
-    # 运费按 ad 单号分摊到主商品
-    ad_counts = (
+    # 5. 运费按 ad 单号分摊到主商品
+    main_ad_counts = (
         work[work["是否主商品"]]
         .groupby(cfg.ad_no, dropna=False)
         .size()
         .rename("主商品行数")
         .reset_index()
     )
-    work = work.merge(ad_counts, on=cfg.ad_no, how="left")
+    work = work.merge(main_ad_counts, on=cfg.ad_no, how="left")
     work["主商品行数"] = work["主商品行数"].fillna(0)
 
-    main_mask = work["是否主商品"] & (work["主商品行数"] > 0)
-    work.loc[main_mask, "运费"] = FREIGHT_PER_AD / work.loc[main_mask, "主商品行数"]
+    alloc_mask = work["是否主商品"] & (work["主商品行数"] > 0)
+    work.loc[alloc_mask, "运费"] = FREIGHT_PER_AD / work.loc[alloc_mask, "主商品行数"]
 
     return work
 
 
+# =====================================
+# 指标计算
+# =====================================
 def calc_metrics(work: pd.DataFrame, cfg: ColumnConfig) -> Dict[str, float]:
     main = work[work["是否主商品"]].copy()
     gifts = work[work["是否赠品"]].copy()
 
     gmv = main[cfg.paid_amount].sum()
     qty = main[cfg.qty].sum()
-    ad_cnt = main[cfg.ad_no].nunique()
+    ad_cnt = float(main[cfg.ad_no].nunique())
 
     marketing_return = main[cfg.marketing_return].sum()
-    gross_profit = gmv - main["产品总成本"].sum() - main["运费"].sum()
+    cost_total = main["产品总成本"].sum()
+    freight_total = main["运费"].sum()
+
+    gross_profit = gmv - cost_total - freight_total
 
     base_commission = gmv * BASE_COMMISSION_RATE
     tech_service_fee = gmv * TECH_SERVICE_RATE
@@ -300,9 +348,9 @@ def calc_metrics(work: pd.DataFrame, cfg: ColumnConfig) -> Dict[str, float]:
     transaction_fee = gmv * TRANSACTION_FEE_RATE
     shipping_insurance = ad_cnt * SHIPPING_INSURANCE_PER_AD
     flow_radar_fee = gmv * FLOW_RADAR_RATE
-    settlement_amount = marketing_return - shipping_insurance - flow_radar_fee
 
-    settlement_profit = settlement_amount - main["产品总成本"].sum() - main["运费"].sum()
+    settlement_amount = marketing_return - shipping_insurance - flow_radar_fee
+    settlement_profit = settlement_amount - cost_total - freight_total
 
     gift_cost = 0.0
     for gift_name, unit_cost in GIFT_COST_MAP.items():
@@ -312,7 +360,7 @@ def calc_metrics(work: pd.DataFrame, cfg: ColumnConfig) -> Dict[str, float]:
     return {
         "GMV": gmv,
         "主商品销量": qty,
-        "有效主商品订单数": float(ad_cnt),
+        "有效主商品订单数": ad_cnt,
         "营销后回款价": marketing_return,
         "毛利": gross_profit,
         "基础佣金": base_commission,
@@ -353,42 +401,83 @@ def build_sku_analysis(work: pd.DataFrame, cfg: ColumnConfig) -> pd.DataFrame:
         - grouped["平台技术服务费"]
         - grouped["基础佣金"]
     )
-    grouped["商品佣金率"] = (grouped["基础佣金"] + grouped["高佣加码"]) / grouped["GMV"].replace(0, pd.NA)
+    grouped["商品佣金率"] = (
+        (grouped["基础佣金"] + grouped["高佣加码"])
+        / grouped["GMV"].replace(0, pd.NA)
+    )
 
-    # ad 单级费用按货号占 GMV 比例简化分摊
     total_gmv = grouped["GMV"].sum()
+    total_shipping_insurance = main[cfg.ad_no].nunique() * SHIPPING_INSURANCE_PER_AD
     if total_gmv > 0:
-        grouped["运费险"] = grouped["GMV"] / total_gmv * (main[cfg.ad_no].nunique() * SHIPPING_INSURANCE_PER_AD)
+        grouped["运费险"] = grouped["GMV"] / total_gmv * total_shipping_insurance
     else:
         grouped["运费险"] = 0.0
+
     grouped["流量雷达服务费"] = grouped["GMV"] * FLOW_RADAR_RATE
     grouped["结算金额"] = grouped["营销后回款价"] - grouped["运费险"] - grouped["流量雷达服务费"]
     grouped["毛利"] = grouped["GMV"] - grouped["产品总成本"] - grouped["运费"]
     grouped["结算后利润"] = grouped["结算金额"] - grouped["产品总成本"] - grouped["运费"]
 
+    grouped = grouped.rename(
+        columns={
+            "货号修正": "货号",
+            cfg.product_name: "商品名称",
+        }
+    )
     grouped = grouped.sort_values("GMV", ascending=False)
-    grouped = grouped.rename(columns={"货号修正": "货号", cfg.product_name: "商品名称"})
     return grouped
 
 
 def build_mapping_issues(work: pd.DataFrame, cfg: ColumnConfig) -> pd.DataFrame:
     main = work[work["是否主商品"]].copy()
     if main.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=["平台", "店铺名称", "货号", "商品名称", "问题类型", "订单行数", "GMV"])
 
-    issues = main[main["销售规格ID"].isna()].copy()
-    if issues.empty:
-        return pd.DataFrame(columns=["平台", "店铺名称", "货号", "商品名称", "订单行数", "GMV"])
+    issue_frames = []
 
-    result = issues.groupby(
-        [cfg.platform, cfg.store_name, "货号修正", cfg.product_name],
-        as_index=False
-    ).agg(
-        订单行数=(cfg.ad_no, "size"),
-        GMV=(cfg.paid_amount, "sum"),
+    # 问题1：缺少最终销售规格ID
+    no_spec = main[main["销售规格ID"].fillna("").eq("")]
+    if not no_spec.empty:
+        tmp = no_spec.groupby(
+            [cfg.platform, cfg.store_name, "货号修正", cfg.product_name],
+            as_index=False
+        ).agg(
+            订单行数=(cfg.ad_no, "size"),
+            GMV=(cfg.paid_amount, "sum"),
+        )
+        tmp["问题类型"] = "缺少销售规格ID"
+        issue_frames.append(tmp)
+
+    # 问题2：有销售规格ID，但没映射到标准产品
+    no_product = main[
+        (~main["销售规格ID"].fillna("").eq(""))
+        & (main["标准产品ID"].fillna("").eq(""))
+    ]
+    if not no_product.empty:
+        tmp = no_product.groupby(
+            [cfg.platform, cfg.store_name, "货号修正", cfg.product_name],
+            as_index=False
+        ).agg(
+            订单行数=(cfg.ad_no, "size"),
+            GMV=(cfg.paid_amount, "sum"),
+        )
+        tmp["问题类型"] = "销售规格ID无法映射标准产品"
+        issue_frames.append(tmp)
+
+    if not issue_frames:
+        return pd.DataFrame(columns=["平台", "店铺名称", "货号", "商品名称", "问题类型", "订单行数", "GMV"])
+
+    result = pd.concat(issue_frames, ignore_index=True)
+    result = result.rename(
+        columns={
+            cfg.platform: "平台",
+            cfg.store_name: "店铺名称",
+            "货号修正": "货号",
+            cfg.product_name: "商品名称",
+        }
     )
-    result = result.rename(columns={cfg.platform: "平台", cfg.store_name: "店铺名称", "货号修正": "货号", cfg.product_name: "商品名称"})
-    return result.sort_values(["订单行数", "GMV"], ascending=[False, False])
+    result = result.sort_values(["问题类型", "订单行数", "GMV"], ascending=[True, False, False])
+    return result
 
 
 def build_gift_analysis(work: pd.DataFrame, cfg: ColumnConfig) -> pd.DataFrame:
@@ -400,12 +489,18 @@ def build_gift_analysis(work: pd.DataFrame, cfg: ColumnConfig) -> pd.DataFrame:
     for gift_name, unit_cost in GIFT_COST_MAP.items():
         qty = gifts.loc[gifts["赠品名称"] == gift_name, cfg.qty].sum()
         if qty > 0:
-            rows.append({
-                "赠品名称": gift_name,
-                "件数": qty,
-                "单件成本": unit_cost,
-                "总成本": qty * unit_cost,
-            })
+            rows.append(
+                {
+                    "赠品名称": gift_name,
+                    "件数": qty,
+                    "单件成本": unit_cost,
+                    "总成本": qty * unit_cost,
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame(columns=["赠品名称", "件数", "单件成本", "总成本"])
+
     return pd.DataFrame(rows).sort_values("总成本", ascending=False)
 
 
@@ -424,13 +519,9 @@ def to_excel_bytes(
     return buffer.getvalue()
 
 
-def fmt_money(x: float) -> str:
-    return f"{x:,.2f}"
-
-
-# =========================
+# =====================================
 # 页面
-# =========================
+# =====================================
 st.title("爱库存经营自动分析工具 v1")
 st.caption("上传订单表 + 3 张映射表，自动输出基础经营分析结果。")
 
@@ -465,15 +556,19 @@ if run_btn:
         sales_df = read_excel_any(sales_file)
         product_df = read_excel_any(product_file)
 
+        validate_mapping_columns(link_df, sales_df, product_df)
+
         orders, cfg = preprocess_orders(order_df)
-        cost_map = build_cost_mapping(link_df, sales_df, product_df)
-        enriched = attach_costs(orders, cfg, cost_map)
+        link_map = build_link_map(link_df)
+        sales_cost_map = build_sales_cost_map(sales_df, product_df)
+        enriched = attach_costs(orders, cfg, link_map, sales_cost_map)
 
         summary = calc_metrics(enriched, cfg)
         sku_df = build_sku_analysis(enriched, cfg)
         issue_df = build_mapping_issues(enriched, cfg)
         gift_df = build_gift_analysis(enriched, cfg)
 
+        # 核心指标
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("GMV", fmt_money(summary["GMV"]))
         c2.metric("主商品销量", f"{summary['主商品销量']:.0f}")
@@ -492,27 +587,36 @@ if run_btn:
         c11.metric("运费险", fmt_money(summary["运费险"]))
         c12.metric("流量雷达服务费", fmt_money(summary["流量雷达服务费"]))
 
+        c13, c14 = st.columns(2)
+        c13.metric("有效主商品订单数", f"{summary['有效主商品订单数']:.0f}")
+        c14.metric("赠品总成本", fmt_money(summary["赠品总成本"]))
+
         st.subheader("货号分析")
-        st.dataframe(
-            sku_df.style.format({
-                "GMV": "{:,.2f}",
-                "销量": "{:,.0f}",
-                "营销后回款价": "{:,.2f}",
-                "产品总成本": "{:,.2f}",
-                "运费": "{:,.2f}",
-                "基础佣金": "{:,.2f}",
-                "平台技术服务费": "{:,.2f}",
-                "高佣加码": "{:,.2f}",
-                "商品佣金率": "{:.1%}",
-                "运费险": "{:,.2f}",
-                "流量雷达服务费": "{:,.2f}",
-                "结算金额": "{:,.2f}",
-                "毛利": "{:,.2f}",
-                "结算后利润": "{:,.2f}",
-            }),
-            use_container_width=True,
-            height=520,
-        )
+        if sku_df.empty:
+            st.info("暂无主商品数据。")
+        else:
+            st.dataframe(
+                sku_df.style.format(
+                    {
+                        "GMV": "{:,.2f}",
+                        "销量": "{:,.0f}",
+                        "营销后回款价": "{:,.2f}",
+                        "产品总成本": "{:,.2f}",
+                        "运费": "{:,.2f}",
+                        "基础佣金": "{:,.2f}",
+                        "平台技术服务费": "{:,.2f}",
+                        "高佣加码": "{:,.2f}",
+                        "商品佣金率": "{:.1%}",
+                        "运费险": "{:,.2f}",
+                        "流量雷达服务费": "{:,.2f}",
+                        "结算金额": "{:,.2f}",
+                        "毛利": "{:,.2f}",
+                        "结算后利润": "{:,.2f}",
+                    }
+                ),
+                use_container_width=True,
+                height=520,
+            )
 
         st.subheader("映射异常")
         if issue_df.empty:
